@@ -16,7 +16,7 @@ class ReRanker(CrossEncoder):
     """
 
     def __init__(self, model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"):
-        super().__init__(model_name_or_path=model_name)
+        super().__init__(model_name=model_name)
         self.model_name = model_name
         self.score_field = "cross_score"
         self.activation_fn = Sigmoid()
@@ -39,7 +39,10 @@ class ReRanker(CrossEncoder):
         # build query/content list
         cross_inp = [[query, hit[hit_field]] for hit in results]
         # get scores
-        cross_scores = self.predict(cross_inp, activation_fn=activation_fn)
+        cross_scores = self.predict(cross_inp)
+        if apply_sigmoid:
+            import torch
+            cross_scores = torch.sigmoid(torch.tensor(cross_scores)).tolist()
         for i, result in enumerate(results):
             result[self.score_field] = cross_scores[i]
 

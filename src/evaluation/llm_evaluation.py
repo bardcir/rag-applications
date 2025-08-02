@@ -1,7 +1,6 @@
 from deepeval.models.base_model import DeepEvalBaseLLM
 from deepeval.metrics import GEval, BaseMetric
 from deepeval.test_case import LLMTestCaseParams, LLMTestCase
-from deepeval.evaluate import TestResult
 from deepeval import evaluate
 
 from anthropic import Anthropic, AsyncAnthropic
@@ -227,17 +226,13 @@ class EvalResponse:
         return self.__dict__
 
 def load_eval_response(metric: BaseMetric | AnswerCorrectnessMetric,
-                       test_case: LLMTestCase | TestResult,
+                       test_case: LLMTestCase,
                        return_context_data: bool=True
                        ) -> EvalResponse:
     '''
     Parses and loads select data from metric and test_case and 
     combines into a single EvalResponse package for ease of viewing. 
     '''
-    if isinstance(test_case, TestResult) and isinstance(metric, list):
-        if len(metric) > 1:
-            raise NotImplementedError("Multiple metrics not supported yet for this loading function")
-        metric = metric[0]
     return EvalResponse(score=metric.score,
                         reason=metric.reason,
                         metric=metric.__class__.__name__,
@@ -248,6 +243,7 @@ def load_eval_response(metric: BaseMetric | AnswerCorrectnessMetric,
                         actual_output=test_case.actual_output,
                         retrieval_context=test_case.retrieval_context if return_context_data else None
                         )
+
 
 class TestCaseGenerator:
 
@@ -319,10 +315,22 @@ class PollingEvaluation:
         '''
         model_name = model if isinstance(model, str) else model.model
         ac_metric = AnswerCorrectnessMetric(model=model, threshold=threshhold)
-        responses = evaluate(test_cases, [ac_metric], print_results=False, verbose_mode=False, show_indicator=False)
+        
+        # Updated API call - evaluate returns a simple list of test results
+        test_results = evaluate(test_cases, [ac_metric], print_results=False, verbose_mode=False, show_indicator=False)
+        
         if return_raw:
-            return responses
-        eval_responses = [load_eval_response(r.metrics_data[0], r) for r in responses.test_results]
+            return test_results
+            
+        # Process the test results
+        eval_responses = []
+        for test_result in test_results:
+            # In the new API, metrics data is accessed differently
+            if hasattr(test_result, 'metrics_data') and test_result.metrics_data:
+                metric = test_result.metrics_data[0]
+                eval_response = load_eval_response(metric, test_result)
+                eval_responses.append(eval_response)
+        
         scores = [r.score for r in eval_responses]
         cost = [r.cost for r in eval_responses if r.cost]
         cost = sum(cost) if any(cost) else 'N/A'
@@ -373,37 +381,44 @@ class PollingEvaluation:
                 raise ValueError("Test cases must be a list of LLMTestCase objects or a list of dictionaries containing the keys: ['input', 'actual_output', 'retrieval_context']")
 
 
-
-
+# NEW FUNCTION FOR THE FIXED GENERATION_EVALUATION
+def generation_evaluation(test_cases: list[LLMTestCase], 
+                         generation_config: dict,
+                         evaluation_llm: str = 'gpt-4-turbo',
+                         eval_threshold: float = 0.8,
+                         context_chunk_size: int = 1000,
+                         context_chunk_overlap: int = 200) -> dict[str, Any]:
+    '''
+    Fixed generation evaluation function that works with the latest deepeval API.
     
-# def get_answer_score(query: str,
-#                      rag_pipeline: RAGPipeline,
-#                      evaluation_llm: str='gpt-4-turbo',
-#                      return_context_data: bool=False
-#                      ):
-#     #define our metric, in this case AnswerCorrectness
-#     metric = AnswerCorrectnessMetric(model=evaluation_llm)
+    The key fix: Instead of calling metric.measure() and trying to use the returned float,
+    we call metric.measure() to populate the metric object, then access the metric attributes directly.
+    '''
     
-#     #this is an instance of the RAGPipeline Class
-#     data = rag_pipeline(query, verbosity=2)
-
-#     #unpack the results of executing the pipeline
-#     query, actual_output, context = data['query'], data['answer'], data['context']
-
-#     #reformat context from list of dicts into list of strings
-#     retrieval_context = create_context_blocks(context)
+    # Create metrics for each test case
+    metrics = []
+    for test_case in test_cases:
+        ac_metric = AnswerCorrectnessMetric(evaluation_model=evaluation_llm, threshold=eval_threshold)
+        
+        # IMPORTANT: In the new API, measure() returns a float score but also populates the metric object
+        # We call measure() to run the evaluation, but then use the metric object itself for data extraction
+        score = ac_metric.measure(test_case, _show_indicator=False)
+        
+        # The metric object now has all the attributes populated
+        metrics.append(ac_metric)
     
-#     #define a LLM Test Case on the fly
-#     test_case = LLMTestCase(input=query, actual_output=actual_output, retrieval_context=retrieval_context)
-
-#     #execute call to evaluation LLM to evaluate AnswerCorrectness
-#     metric.measure(test_case)
-
-#     #return response as an EvalResponse (nothing special just an easier way to organize info
-#     response = load_eval_response(metric, test_case, return_context_data=return_context_data)
-#     return response
-
-# retrieval_args = list(inspect.signature(client.hybrid_search).parameters)
-# retrieval_dict = {k:v for k,v in retrieval_kwargs.items() if k in retrieval_args}
-# llm_args = list(inspect.signature(self.llm.chat_completion).parameters)
-# llm_dict = {k:v for k,v in llm_kwargs.items() if k in llm_args}
+    # Now we can safely use the metric objects (not the returned floats)
+    eval_responses = [load_eval_response(metric, test_case, return_context_data=False) for 
+                      metric, test_case in zip(metrics, test_cases)]
+    
+    scores = [r.score for r in eval_responses]
+    # if using an OpenAI model cost will be a float value, otherwise it will be 'N/A'
+    cost = [r.cost for r in eval_responses if r.cost]
+    total_cost = sum(cost) if any(cost) else 'N/A'
+    
+    return {
+        'generation_eval': eval_responses,
+        'scores': scores,
+        'cost': total_cost,
+        'model': evaluation_llm
+    }
